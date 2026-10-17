@@ -126,6 +126,11 @@ PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_i
 PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
 (( PY_MINOR >= 10 )) || die "Python $PY_VER detected — requires 3.10+"
 ok "Python $PY_VER"
+if (( PY_MINOR >= 13 )); then
+    warn "Python $PY_VER is very new — some pin-heavy tools (roadrecon, mitm6, lsassy,"
+    warn "dploot) may lack 3.13+ wheels and will be skipped with a warning. Core"
+    warn "AdStrike still works. If many packages fail, retry on Python 3.11/3.12."
+fi
 
 # ── APT — install system packages ────────────────────────────────────────────
 step "Installing system packages"
@@ -193,7 +198,38 @@ step "Upgrading pip / setuptools / wheel"
 "${PIP_CMD[@]}" install -q --upgrade pip setuptools wheel && ok "pip upgraded"
 
 step "Installing Python dependencies"
-[[ -f "$REQ_FILE" ]] && "${PIP_CMD[@]}" install -q -r "$REQ_FILE" && ok "requirements.txt installed"
+# Fault-tolerant: a single core package that cannot build/resolve (common on
+# bleeding-edge Python) must NOT abort the whole installer under `set -e`. Try
+# the batch install first; on failure, retry one-by-one to pinpoint and report
+# exactly which requirement(s) failed, then continue with reduced functionality.
+if [[ -f "$REQ_FILE" ]]; then
+    if "${PIP_CMD[@]}" install -q -r "$REQ_FILE"; then
+        ok "requirements.txt installed"
+    else
+        warn "Batch install hit a failure on Python $PY_VER — retrying package-by-package"
+        FAILED_PKGS=()
+        while IFS= read -r raw; do
+            pkg="${raw%%#*}"               # strip inline/line comments
+            pkg="$(echo "$pkg" | xargs)"   # trim whitespace
+            [[ -z "$pkg" ]] && continue
+            if "${PIP_CMD[@]}" install -q "$pkg" >/dev/null 2>&1; then
+                ok "  $pkg"
+            else
+                warn "  $pkg FAILED"
+                FAILED_PKGS+=("$pkg")
+            fi
+        done < "$REQ_FILE"
+        if (( ${#FAILED_PKGS[@]} )); then
+            warn "Unresolved dependencies: ${FAILED_PKGS[*]}"
+            warn "AdStrike will run with reduced functionality. Install these manually,"
+            warn "e.g. on a Python 3.11/3.12 venv, then re-run bash install.sh."
+        else
+            ok "requirements.txt installed (after per-package retry)"
+        fi
+    fi
+else
+    warn "requirements.txt not found at $REQ_FILE — skipping core dependency install"
+fi
 
 step "Installing extra pip-only tools"
 for pkg in netexec certipy-ad bloodhound mitm6 lsassy dploot roadrecon roadtx ldap3; do
@@ -314,32 +350,49 @@ fi
 
 # ── Fix nxc impacket import (regsecrets.py missing from pip impacket) ────────
 step "Fixing impacket/nxc version compatibility"
-# System nxc was built against system impacket which has gkdi.py, dpapi_ng.py,
-# WIN_VERSIONS etc. The pip-installed impacket (0.14.0) is missing these.
-# The _nxc() agent wrapper sets PYTHONPATH to use system impacket for nxc calls.
-# As a belt-and-suspenders fix, also copy the missing files to pip impacket.
+# System nxc was built against the system impacket, which ships helper modules
+# (gkdi.py, dpapi_ng.py, regsecrets.py, ...) that some pip impacket releases lack.
+# The _nxc() agent wrapper already sets PYTHONPATH to the system impacket for nxc
+# calls (the primary, version-safe path). As a belt-and-suspenders fallback we may
+# ALSO copy only the *missing* helper files into the pip impacket — but mixing
+# .py files across different impacket versions is fragile, so we first compare the
+# two versions and only copy when they are close enough (same major.minor), and we
+# never clobber a file the pip impacket already provides correctly.
 PIP_IMP=$("$VENV_PY" -c "import impacket, os; print(os.path.dirname(impacket.__file__))" 2>/dev/null || true)
 SYS_IMP="/usr/lib/python3/dist-packages/impacket"
+_impver() { "$1" -c "from importlib.metadata import version; print(version('impacket'))" 2>/dev/null || echo "unknown"; }
 if [[ -n "$PIP_IMP" && -d "$SYS_IMP" ]]; then
-    copied=0
-    for f in dpapi_ng.py msada_guids.py regsecrets.py; do
-        if [[ -f "$SYS_IMP/$f" && ! -f "$PIP_IMP/$f" ]]; then
-            cp "$SYS_IMP/$f" "$PIP_IMP/$f" && ((copied++)) || true
+    PIP_IMP_VER=$(_impver "$VENV_PY")
+    SYS_IMP_VER=$(python3 -c "from importlib.metadata import version; print(version('impacket'))" 2>/dev/null || echo "unknown")
+    ok "impacket versions — venv: ${PIP_IMP_VER}, system: ${SYS_IMP_VER}"
+
+    pip_mm="${PIP_IMP_VER%.*}"; sys_mm="${SYS_IMP_VER%.*}"
+    if [[ "$PIP_IMP_VER" == "unknown" || "$SYS_IMP_VER" == "unknown" || "$pip_mm" != "$sys_mm" ]]; then
+        warn "venv/system impacket differ (${PIP_IMP_VER} vs ${SYS_IMP_VER}) — skipping cross-version"
+        warn "file copy to avoid a broken mixed install. nxc calls use the PYTHONPATH fix instead."
+    else
+        copied=0
+        for f in dpapi_ng.py msada_guids.py regsecrets.py; do
+            if [[ -f "$SYS_IMP/$f" && ! -f "$PIP_IMP/$f" ]]; then
+                cp "$SYS_IMP/$f" "$PIP_IMP/$f" && ((copied++)) || true
+            fi
+        done
+        for f in gkdi.py icpr.py tsts.py; do
+            if [[ -f "$SYS_IMP/dcerpc/v5/$f" && ! -f "$PIP_IMP/dcerpc/v5/$f" ]]; then
+                cp "$SYS_IMP/dcerpc/v5/$f" "$PIP_IMP/dcerpc/v5/$f" && ((copied++)) || true
+            fi
+        done
+        # Only replace examples/utils.py when the pip version actually lacks the
+        # parse_identity helper getTGT.py needs — never clobber a working one.
+        if [[ -f "$SYS_IMP/examples/utils.py" ]] \
+           && ! "$VENV_PY" -c "from impacket.examples.utils import parse_identity" 2>/dev/null; then
+            cp "$SYS_IMP/examples/utils.py" "$PIP_IMP/examples/utils.py" && ((copied++)) || true
         fi
-    done
-    for f in gkdi.py icpr.py tsts.py; do
-        if [[ -f "$SYS_IMP/dcerpc/v5/$f" && ! -f "$PIP_IMP/dcerpc/v5/$f" ]]; then
-            cp "$SYS_IMP/dcerpc/v5/$f" "$PIP_IMP/dcerpc/v5/$f" && ((copied++)) || true
-        fi
-    done
-    # Always overwrite utils.py — system version has parse_identity needed by getTGT.py
-    if [[ -f "$SYS_IMP/examples/utils.py" ]]; then
-        cp "$SYS_IMP/examples/utils.py" "$PIP_IMP/examples/utils.py" && ((copied++)) || true
+        ok "impacket compatibility: $copied missing file(s) synced from system to pip"
     fi
-    ok "impacket compatibility: $copied missing files synced from system to pip"
 else
-    warn "Could not sync impacket files — nxc ldap may have import errors"
-    warn "Workaround: the agent uses PYTHONPATH fix automatically"
+    warn "Could not locate both impacket copies — nxc ldap may have import errors"
+    warn "Workaround: the agent uses the PYTHONPATH fix automatically"
 fi
 
 # ── kerbrute ─────────────────────────────────────────────────────────────────
